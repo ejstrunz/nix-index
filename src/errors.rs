@@ -2,14 +2,14 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
-use crate::{hydra, nixpkgs, package::StorePath};
+use crate::{hydra, nixpkgs_old, package::StorePath};
 
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("querying available packages failed: {source}")]
     QueryPackages {
         #[source]
-        source: nixpkgs::Error,
+        source: nixpkgs_old::Error,
     },
     #[error("fetching the file listing for store path '{path}' failed: {source}")]
     FetchFiles {

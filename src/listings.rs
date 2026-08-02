@@ -10,7 +10,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use crate::errors::{Error, Result};
 use crate::files::FileTree;
 use crate::hydra::Fetcher;
-use crate::nixpkgs;
+use crate::nixpkgs_old;
 use crate::package::StorePath;
 use crate::workset::{WorkSet, WorkSetHandle, WorkSetWatch};
 
@@ -154,9 +154,9 @@ pub fn fetch<'a>(
     let all_paths = all_queries
         .par_iter()
         .flat_map_iter(|&(system, scope)| {
-            nixpkgs::query_packages(nixpkgs, system, scope.as_deref(), show_trace)
+            nixpkgs_old::query_packages(nixpkgs, system, scope.as_deref(), show_trace)
         })
-        .collect::<std::result::Result<_, nixpkgs::Error>>()
+        .collect::<std::result::Result<_, nixpkgs_old::Error>>()
         .map_err(|e| Error::QueryPackages { source: e })?;
 
     Ok(fetch_listings_impl(fetcher, jobs, all_paths))

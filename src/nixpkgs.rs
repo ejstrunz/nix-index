@@ -1,457 +1,140 @@
 //! Read package information from nix-env.
-//!
-//! This module implements the gathering of initial set of root store paths to fetch.
-//! We parse the output `nix-env --query` to figure out all accessible store paths with their attribute path
-//! and hashes.
-use std::error;
-use std::fmt;
-use std::io::{self, Read};
-use std::process::{Child, ChildStdout, Command, Stdio};
 
-use xml;
-use xml::common::{Position, TextPosition};
-use xml::reader::{EventReader, XmlEvent};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
+use anyhow::Context;
+use futures::prelude::*;
 
-use crate::package::{PathOrigin, StorePath};
+use nix_bindings::{self as nix, NixValueOps, Value, ValueType::{self, Attrs, Thunk}};
 
-/// Calls `nix-env` to list the packages in the given nixpkgs.
-///
-/// The `nixpkgs` argument can either be a path to a nixpkgs checkout or another expression
-/// accepted by `nix-env -f`, such as `<nixpkgs>` or `http://example.org/nixpkgs.tar.bz`.
-///
-/// If system is `Some(platform)`, nix-env is called with the `--argstr system <platform>` argument so that
-/// the specified platform would be used instead of the default host system platform.
-///
-/// If scope is `Some(attr)`, nix-env is called with the `-A attr` argument so only packages that are a member
-/// of `attr` are returned.
-///
-/// The function returns an Iterator over the packages returned by nix-env.
-pub fn query_packages(
-    nixpkgs: &str,
-    system: Option<&str>,
-    scope: Option<&str>,
-    show_trace: bool,
-) -> PackagesQuery<ChildStdout> {
-    let mut cmd = Command::new("nix-env");
-    cmd.arg("-qaP")
-        .arg("--out-path")
-        .arg("--xml")
-        .arg("--arg")
-        .arg("config")
-        .arg("{ allowAliases = false; }") // override default nixpkgs config discovery
-        .arg("--arg")
-        .arg("overlays")
-        .arg("[ ]")
-        .arg("--file")
-        .arg(nixpkgs)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
+thread_local! {
+    pub static NIX_CONTEXT: Arc<nix::Context> = {
+        let thread_id = std::thread::current().id();
+        let ctx = nix::Context::new()
+            .expect(format!("Could not initialise Nix library context in thread {:?}!", thread_id).as_str());
 
-    if let Some(system) = system {
-        cmd.arg("--argstr").arg("system").arg(system);
-    }
-
-    if let Some(scope) = scope {
-        cmd.arg("-A").arg(scope);
-    }
-
-    if show_trace {
-        cmd.arg("--show-trace");
-    }
-
-    PackagesQuery {
-        parser: None,
-        child: None,
-        cmd: Some(cmd),
-    }
+        Arc::new(ctx)
+    };
 }
 
-/// An iterator that parses the output of nix-env and returns parsed store paths.
-///
-/// Use `query_packages` to create a value of this type.
-pub struct PackagesQuery<R: Read> {
-    parser: Option<PackagesParser<R>>,
-    child: Option<Child>,
-    cmd: Option<Command>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Package {
+    name: String,
+    version: String
 }
 
-impl PackagesQuery<ChildStdout> {
-    /// Spawns the nix-env subprocess and initializes the parser.
-    ///
-    /// If the subprocess was already spawned, does nothing.
-    fn ensure_initialized(&mut self) -> Result<(), Error> {
-        if let Some(mut cmd) = self.cmd.take() {
-            let mut child = cmd.spawn()?;
+impl<'a> TryFrom<(String, Value<'a>)> for Package {
+    type Error = anyhow::Error;
+    
+    fn try_from((name, attrs): (String, Value<'a>)) -> anyhow::Result<Package> {
+        println!("try_from({}, {:?})", name, attrs);
+        match attrs.value_type() {
+            Thunk => {
+                attrs.force().with_context(|| format!("Failed to force thunk for key '{}'", name))?;
 
-            let stdout = child.stdout.take().expect("should have stdout pipe");
-            let parser = PackagesParser::new(stdout);
+                // If Value::force did not get rid of the Thunk, then we will go into an infinite loop here.
+                // However, force *should* error in such cases instead of doing nothing.
+                debug_assert_eq!(attrs.value_type(), ValueType::Thunk);
 
-            self.child = Some(child);
-            self.parser = Some(parser);
+                Ok(Self::try_from((name, attrs))?)
+            },
+            Attrs => {
+                if !attrs.has_attr("version")? {
+                    return Err(nix::Error::KeyNotFound("version".to_owned()).into());
+                }
+
+                let version = attrs.get_attr("version")?.as_string()?;
+                Ok(Package { name, version })
+            },
+            _ => Err(anyhow::Error::new(nix::Error::InvalidType { expected: "attrs", actual: attrs.type_name() }))
+                .context("Tried to create package from non-attrs object")
         }
-        Ok(())
     }
+}
 
-    /// Waits for the subprocess to exit and checks whether it has returned a non-zero exit code
-    /// (= failed with an error).
-    ///
-    /// If the exit code was non-zero, returns Some(err), else it returns None.
-    fn check_error(&mut self) -> Option<Error> {
-        let mut run = || {
-            let child = match self.child.take() {
-                Some(c) => c,
-                None => return Ok(()),
-            };
-            let result = child.wait_with_output()?;
+pub struct PackagesQuery(std::sync::mpsc::Receiver<Package>);
 
-            if !result.status.success() {
-                let message = String::from_utf8_lossy(&result.stderr);
+const IMPORT_NIXPKGS: &str = "import <nixpkgs> {}";
 
-                return Err(Error::Command(format!(
-                    "nix-env failed with {}:\n{}",
-                    result.status, message,
-                )));
-            }
+impl PackagesQuery {
+    pub async fn new(nixpkgs: PathBuf) -> anyhow::Result<PackagesQuery> {
+        let (tx, rx) = std::sync::mpsc::channel::<Package>();
 
+        tokio::task::spawn_blocking(move || {
+            NIX_CONTEXT.with(|ctx| {
+                let store = Arc::new(nix::Store::open(ctx, None)
+                    .context("Failed to open the default Nix store")?);
+
+                let nixpkgs = nixpkgs.canonicalize()
+                    .with_context(|| format!("Could not canonicalize nixpkgs path: {:?}", nixpkgs))?;
+
+                let paths = [format!("nixpkgs={}", nixpkgs.display())];
+                let eval = nix::EvalStateBuilder::new(&store)?
+                    .set_lookup_path(&paths)?
+                    .build()
+                    .context("Could not construct the EvalState")?;
+                
+                let pkgs = eval.eval_from_string(IMPORT_NIXPKGS, "<eval>")
+                    .with_context(|| format!("Failed to evaluate '{}'", IMPORT_NIXPKGS))?;
+
+                pkgs.attr_keys()
+                pkgs.attrs()?
+                    .filter_map(Result::ok)
+                    .filter_map(|attr| match attr {
+                        (ref name, ref value) if value.value_type() == ValueType::Thunk => {
+                            println!("forcing thunk for {}", name);
+                            value.force().ok().map(|_| attr)
+                        },
+                        _ => Some(attr)
+                    })
+                    .filter(|(_, value)| value.value_type() == ValueType::Attrs)
+                    .try_for_each(|attr| {
+                        match Package::try_from(attr) {
+                            Ok(pkg) => tx.send(pkg).map_err(anyhow::Error::new),
+                            Err(_) => Ok(()), // This is not a package, skip
+                        }
+                    })
+            })?;
+
+            Ok(PackagesQuery(rx))
+        }).await?
+    }
+}
+
+impl Stream for PackagesQuery {
+    type Item = anyhow::Result<Package>;
+    
+    fn poll_next(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<anyhow::Result<Package>>> {
+        use std::task::Poll::*;
+        use std::sync::mpsc::TryRecvError::*;
+
+        match self.0.try_recv() {
+            Ok(pkg) => Ready(Some(Ok(pkg))),
+            Err(Empty) => Pending,
+            Err(Disconnected) => Ready(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    pub async fn test_query_packages() -> anyhow::Result<()> {
+        use std::io::Write;
+        use futures::TryStreamExt;
+
+        let query = PackagesQuery::new(PathBuf::try_from("/nix/var/nix/profiles/per-user/root/channels/nixos")?).await?;
+
+        println!("Querying...");
+
+        query.try_for_each_concurrent(None, async |pkg| {
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{} {}", pkg.name, pkg.version)?;
             Ok(())
-        };
-
-        run().err()
-    }
-}
-
-impl Iterator for PackagesQuery<ChildStdout> {
-    type Item = Result<StorePath, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Err(e) = self.ensure_initialized() {
-            return Some(Err(e));
-        }
-        self.parser.take().and_then(|mut parser| {
-            parser
-                .next()
-                .map(|v| {
-                    self.parser = Some(parser);
-                    // When the parser throws an error, we first wait for the subprocess to exit.
-                    //
-                    // If the subprocess returned an error, then the parser probably tried to parse garbage output
-                    // so we will ignore the parser error and instead return the error printed by the subprocess.
-                    v.map_err(|e| self.check_error().unwrap_or_else(|| Error::from(e)))
-                })
-                .or_else(|| {
-                    self.parser = None;
-                    // At the end, we should check if the subprocess exited successfully.
-                    self.check_error().map(Err)
-                })
-        })
-    }
-}
-
-/// Parses the XML output of `nix-env` and returns individual store paths.
-struct PackagesParser<R: Read> {
-    events: EventReader<R>,
-    current_item: Option<(String, String)>,
-}
-
-/// A parser error that may occur during parsing `nix-env`'s output.
-#[derive(Debug)]
-pub struct ParserError {
-    position: TextPosition,
-    kind: ParserErrorKind,
-}
-
-/// Enumerates all possible error kinds that may occur during parsing.
-#[derive(Debug)]
-pub enum ParserErrorKind {
-    /// Found an element with the tag `element_name` that should only occur inside
-    /// elements with the tag `expected_parent` but it occurred as child of a different parent.
-    MissingParent {
-        element_name: String,
-        expected_parent: String,
-    },
-
-    /// An element occurred as a child of `found_parent`, but
-    /// we know that elements with the tag `element_name` should never have that as
-    /// a parent.
-    ParentNotAllowed {
-        element_name: String,
-        found_parent: String,
-    },
-
-    /// The required attribute `attribute_name` was missing on an element with the tag `element_name`.
-    MissingAttribute {
-        element_name: String,
-        attribute_name: String,
-    },
-
-    /// Found the end tag for `element_name` without a matching start tag.
-    MissingStartTag { element_name: String },
-
-    /// An XML syntax error.
-    XmlError { error: xml::reader::Error },
-
-    /// A store path in the output of `nix-env` could not be parsed. All valid store paths
-    /// need to match the format `$(STOREDIR)$(HASH)-$(NAME)`.
-    InvalidStorePath { path: String },
-}
-
-impl fmt::Display for ParserError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        use self::ParserErrorKind::*;
-        write!(f, "error at {}: ", self.position)?;
-        match self.kind {
-            MissingParent {
-                ref element_name,
-                ref expected_parent,
-            } => {
-                write!(
-                    f,
-                    "element {} appears outside of expected parent {}",
-                    element_name, expected_parent
-                )
-            }
-            ParentNotAllowed {
-                ref element_name,
-                ref found_parent,
-            } => {
-                write!(
-                    f,
-                    "element {} must not appear as child of {}",
-                    element_name, found_parent
-                )
-            }
-            MissingAttribute {
-                ref element_name,
-                ref attribute_name,
-            } => {
-                write!(
-                    f,
-                    "element {} must have an attribute named {}",
-                    element_name, attribute_name
-                )
-            }
-            MissingStartTag { ref element_name } => {
-                write!(f, "element {} does not have a start tag", element_name)
-            }
-            XmlError { ref error } => write!(f, "document not well-formed: {}", error),
-            InvalidStorePath { ref path } => {
-                write!(
-                    f,
-                    "store path does not match expected format /prefix/hash-name: {}",
-                    path
-                )
-            }
-        }
-    }
-}
-
-impl<R: Read> PackagesParser<R> {
-    /// Creates a new parser that reads the `nix-env` XML output from the given reader.
-    pub fn new(reader: R) -> PackagesParser<R> {
-        PackagesParser {
-            events: EventReader::new(reader),
-            current_item: None,
-        }
-    }
-
-    /// Shorthand for exiting with an error at the current position.
-    fn err(&self, kind: ParserErrorKind) -> ParserError {
-        ParserError {
-            position: self.events.position(),
-            kind,
-        }
-    }
-
-    /// Tries to read the next `StorePath` from the reader or fail with an error
-    /// if there was a parse failure.
-    ///
-    /// Returns Ok(None) if the end of the stream was reached.
-    ///
-    /// This function is like `.next` from `Iterator`, but allows us to use `try! / ?` since it
-    /// returns `Result<Option<...>, ...>` instead of `Option<Result<..., ...>>`.
-    fn next_err(&mut self) -> Result<Option<StorePath>, ParserError> {
-        use self::ParserErrorKind::*;
-        use self::XmlEvent::*;
-
-        loop {
-            let event = self
-                .events
-                .next()
-                .map_err(|e| self.err(XmlError { error: e }))?;
-            match event {
-                StartElement {
-                    name: element_name,
-                    attributes,
-                    ..
-                } => {
-                    if element_name.local_name == "item" {
-                        if self.current_item.is_some() {
-                            return Err(self.err(ParentNotAllowed {
-                                element_name: "item".to_string(),
-                                found_parent: "item".to_string(),
-                            }));
-                        }
-
-                        let mut attr_path = None;
-                        let mut system = None;
-
-                        for attr in attributes {
-                            if attr.name.local_name == "attrPath" {
-                                attr_path = Some(attr.value);
-                                continue;
-                            }
-
-                            if attr.name.local_name == "system" {
-                                system = Some(attr.value);
-                                continue;
-                            }
-                        }
-
-                        let attr_path = attr_path.ok_or_else(|| {
-                            self.err(MissingAttribute {
-                                element_name: "item".into(),
-                                attribute_name: "attrPath".into(),
-                            })
-                        })?;
-
-                        let system = system.ok_or_else(|| {
-                            self.err(MissingAttribute {
-                                element_name: "item".into(),
-                                attribute_name: "system".into(),
-                            })
-                        })?;
-
-                        self.current_item = Some((attr_path, system));
-                        continue;
-                    }
-
-                    if element_name.local_name == "output" {
-                        if let Some((item, system)) = self.current_item.clone() {
-                            let mut output_name = None;
-                            let mut output_path = None;
-
-                            for attr in attributes {
-                                if attr.name.local_name == "name" {
-                                    output_name = Some(attr.value);
-                                    continue;
-                                }
-
-                                if attr.name.local_name == "path" {
-                                    output_path = Some(attr.value);
-                                    continue;
-                                }
-                            }
-
-                            let output_name = output_name.ok_or_else(|| {
-                                self.err(MissingAttribute {
-                                    element_name: "output".into(),
-                                    attribute_name: "name".into(),
-                                })
-                            })?;
-
-                            let output_path = output_path.ok_or_else(|| {
-                                self.err(MissingAttribute {
-                                    element_name: "output".into(),
-                                    attribute_name: "path".into(),
-                                })
-                            })?;
-
-                            let origin = PathOrigin {
-                                attr: item,
-                                output: output_name,
-                                toplevel: true,
-                                system: Some(system),
-                            };
-                            let store_path = StorePath::parse(origin, &output_path);
-                            let store_path = store_path
-                                .ok_or_else(|| self.err(InvalidStorePath { path: output_path }))?;
-
-                            return Ok(Some(store_path));
-                        } else {
-                            return Err(self.err(MissingParent {
-                                element_name: "output".into(),
-                                expected_parent: "item".into(),
-                            }));
-                        }
-                    }
-                }
-
-                EndElement { name: element_name } => {
-                    if element_name.local_name == "item" {
-                        if self.current_item.is_none() {
-                            return Err(self.err(MissingStartTag {
-                                element_name: "item".into(),
-                            }));
-                        }
-                        self.current_item = None
-                    }
-                }
-
-                EndDocument => break,
-
-                _ => {}
-            }
-        }
-
-        Ok(None)
-    }
-}
-
-impl<R: Read> Iterator for PackagesParser<R> {
-    type Item = Result<StorePath, ParserError>;
-
-    fn next(&mut self) -> Option<Result<StorePath, ParserError>> {
-        match self.next_err() {
-            Err(e) => Some(Err(e)),
-            Ok(Some(i)) => Some(Ok(i)),
-            Ok(None) => None,
-        }
-    }
-}
-
-/// Enumeration of all the possible errors that may happen during querying the packages.
-#[derive(Debug)]
-pub enum Error {
-    /// Parsing of the output failed
-    Parse(ParserError),
-
-    /// An IO error occurred
-    Io(io::Error),
-
-    /// nix-env failed with an error message
-    Command(String),
-}
-
-impl error::Error for Error {
-    fn description(&self) -> &str {
-        match *self {
-            Error::Parse(_) => "nix-env output parse error",
-            Error::Io(_) => "io error",
-            Error::Command(_) => "nix-env error",
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        use self::Error::*;
-        match *self {
-            Parse(ref e) => write!(f, "parsing XML output of nix-env failed: {}", e),
-            Io(ref e) => write!(f, "IO error: {}", e),
-            Command(ref e) => write!(f, "nix-env failed with error: {}", e),
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Error {
-        Error::Io(err)
-    }
-}
-
-impl From<ParserError> for Error {
-    fn from(err: ParserError) -> Error {
-        Error::Parse(err)
+        }).await
     }
 }

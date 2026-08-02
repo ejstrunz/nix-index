@@ -13,6 +13,7 @@ pub mod frcode;
 pub mod hydra;
 pub mod listings;
 pub mod nixpkgs;
+pub mod nixpkgs_old;
 pub mod package;
 pub mod util;
 pub mod workset;

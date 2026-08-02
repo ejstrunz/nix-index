@@ -9,7 +9,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-compat }:
+  outputs = { self, nixpkgs, ... }:
     let
       inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" "aarch64-linux" ];
@@ -33,7 +33,13 @@
             lockFile = ./Cargo.lock;
           };
 
-          buildInputs = [ sqlite ];
+          preConfigure = ''
+            export LIBCLANG_PATH="${lib.getLib clang.cc}/lib"
+          '';
+
+          nativeBuildInputs = [ pkg-config clang ];
+
+          buildInputs = [ sqlite nix.dev ];
 
           postInstall = ''
             substituteInPlace command-not-found.sh \
@@ -64,9 +70,11 @@
         minimal = with nixpkgsFor.${system}; mkShell {
           name = "nix-index";
 
-          nativeBuildInputs = [ pkg-config ];
+          nativeBuildInputs = [ pkg-config clang ];
 
-          buildInputs = [ sqlite ];
+          buildInputs = [ sqlite nix.dev ];
+
+          env.LIBCLANG_PATH = "${lib.getLib clang.cc}/lib";
         };
 
         default = with nixpkgsFor.${system}; mkShell {
@@ -76,7 +84,10 @@
 
           nativeBuildInputs = [ rustc cargo clippy rustfmt ];
 
-          env.RUST_SRC_PATH = rustPlatform.rustLibSrc;
+          env = {
+            RUST_SRC_PATH = rustPlatform.rustLibSrc;
+            LIBCLANG_PATH = "${lib.getLib clang.cc}/lib";
+          };
         };
       });
 

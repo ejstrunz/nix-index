@@ -49,6 +49,9 @@ xdg = "3.0.0"
 xml-rs = "1.0.0"
 xz2 = "0.1.7"
 zstd = { version = "0.13.3", features = [ "zstdmt" ] }
+nix-bindings = "0.2347.8"
+anyhow = "1.0.104"
+tokio-stream = { version = "0.1.19", features = ["rt", "sync"] }
 
 [dependencies.tokio]
 features = ["full"]
@@ -64,7 +67,5 @@ version = "0.40.0"
 
 [[example]]
 name = "nix-index-debug"
-
-[profile]
 [profile.release]
 debug = true
