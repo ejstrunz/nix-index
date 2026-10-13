@@ -142,7 +142,7 @@ mod tests {
         });*/
     }
 
-    /*#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     pub async fn test_query_packages() -> anyhow::Result<()> {
         use std::io::Write;
         use futures::TryStreamExt;
@@ -156,5 +156,5 @@ mod tests {
             writeln!(stdout, "{} {}", pkg.name, pkg.version)?;
             Ok(())
         }).await
-    }*/
+    }
 }

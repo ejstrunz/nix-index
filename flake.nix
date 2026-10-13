@@ -11,6 +11,11 @@
 
     crane.url = "github:ipetkov/crane";
 
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     flake-utils = {
       url = "github:numtide/flake-utils";
     };
@@ -21,6 +26,7 @@
       self,
       nixpkgs,
       flake-utils,
+      rust-overlay,
       crane,
       ...
     }:
@@ -32,8 +38,10 @@
         "aarch64-darwin"
         "aarch64-linux"
       ];
-      nixpkgsFor = system: nixpkgs.legacyPackages.${system};
-
+      nixpkgsFor = system: import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      };
 
       cargoTOML = lib.importTOML ./Cargo.toml;
     in
@@ -104,23 +112,26 @@
         devShells = {
           default = craneLib.devShell {
             checks = self.checks.${system};
-            name = "nix-index";
 
             packages = with pkgs; [
               nixfmt nixd
             ];
+
+            env = {
+              RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
+            };
           };
         };
 
         apps = {
           nix-index = {
             type = "app";
-            program = lib.getExe' "nix-index" self.packages.${system}.default;
+            program = lib.getExe' nix-index "nix-index";
           };
 
           nix-locate = {
             type = "app";
-            program = lib.getExe' "nix-locate" self.packages.${system}.default;
+            program = lib.getExe' nix-index "nix-locate";
           };
 
           default = self.apps.${system}.nix-locate;
