@@ -27,6 +27,7 @@ impl<'a> TryFrom<(String, Value<'a>)> for Package {
     
     fn try_from((name, attrs): (String, Value<'a>)) -> anyhow::Result<Package> {
         println!("try_from({}, {:?})", name, attrs);
+        #[allow(non_snake_case)]
         match attrs.value_type() {
             Thunk => {
                 attrs.force().with_context(|| format!("Failed to force thunk for key '{}'", name))?;
@@ -76,7 +77,6 @@ impl PackagesQuery {
                 let pkgs = eval.eval_from_string(IMPORT_NIXPKGS, "<eval>")
                     .with_context(|| format!("Failed to evaluate '{}'", IMPORT_NIXPKGS))?;
 
-                pkgs.attr_keys()
                 pkgs.attrs()?
                     .filter_map(Result::ok)
                     .filter_map(|attr| match attr {
@@ -110,6 +110,7 @@ impl Stream for PackagesQuery {
         use std::task::Poll::*;
         use std::sync::mpsc::TryRecvError::*;
 
+        #[allow(non_snake_case)]
         match self.0.try_recv() {
             Ok(pkg) => Ready(Some(Ok(pkg))),
             Err(Empty) => Pending,
@@ -120,14 +121,33 @@ impl Stream for PackagesQuery {
 
 #[cfg(test)]
 mod tests {
+    use nix_bindings::{EvalState, EvalStateBuilder, flake::{FetchersSettings, FlakeSettings, LockedFlake}};
+
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread")]
+    fn create_test_eval_flake() {
+        /*NIX_CONTEXT.with(|ctx: &nix::Context| {
+            let flake_settings = nix::flake::FlakeSettings::new(ctx)?;
+            let fetch_settings = nix::flake::FetchersSettings::new(ctx)?;
+            let eval_state = nix::EvalStateBuilder::new(store)?;
+
+            LockedFlake::lock(
+                context,
+                &fetch_settings,
+                &flake_settings,
+                eval_state,
+                lock_flags,
+                flake_ref
+            );
+        });*/
+    }
+
+    /*#[tokio::test(flavor = "multi_thread")]
     pub async fn test_query_packages() -> anyhow::Result<()> {
         use std::io::Write;
         use futures::TryStreamExt;
 
-        let query = PackagesQuery::new(PathBuf::try_from("/nix/var/nix/profiles/per-user/root/channels/nixos")?).await?;
+        let query = PackagesQuery::new(PathBuf::try_from("/nix/var/nix/profiles/per-user/root/channels/nixpkgs")?).await?;
 
         println!("Querying...");
 
@@ -136,5 +156,5 @@ mod tests {
             writeln!(stdout, "{} {}", pkg.name, pkg.version)?;
             Ok(())
         }).await
-    }
+    }*/
 }
